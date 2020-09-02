@@ -3,6 +3,7 @@ void main(void){
 	printf("hello world !\n");
 	printf("test git commit !\n");
 	/*real want to modify */
-	/* git2 repo modify */
+	/* want to modfiy test mergen */
+	/* test mergetn in repo test */
 
 }
