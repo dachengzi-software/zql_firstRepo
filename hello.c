@@ -5,5 +5,6 @@ void main(void){
 	/*real want to modify */
 	/* want to modfiy test mergen */
 	/* test mergetn in repo test */
+	printf("test patch\n");
 
 }
