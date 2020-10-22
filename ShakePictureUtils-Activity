@@ -1,0 +1,19 @@
+
+在onCreate方法中去初始化摇一摇
+
+	ShakePictureUtils mShakePictureUtils = new ShakePictureUtils(this);
+
+
+在onResume方法中去注册
+    @Override
+    protected void onResume() {
+        super.onResume();
+        mShakePictureUtils.registerSensor();
+    }
+
+在onPause方法中去解注册
+    @Override
+    protected void onPause() {
+        super.onPause();
+        mShakePictureUtils.unRegisterSensor();
+    }
