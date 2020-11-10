@@ -1,0 +1,381 @@
+触摸屏事件
+
+内核已经为我们的触摸屏提供了框架,其中支持了相关的上报事件类型如下
+
+
+参考下这里,有论述BIN_TOUCH这个事件代码,意思是说表示触摸,且必须是发送的第一个代码也就是先被上报.其中1表示被按下,0表示浮空.这里先不考虑触摸压力,触摸压力这里与这个位也有关系.
+ABS_{X,Y} must be reported with the location of the touch. BTN_TOUCH must be used to report when a touch is active on the screen. BTN_{MOUSE,LEFT,MIDDLE,RIGHT} must not be reported as the result of touch contact. BTN_TOOL_ events should be reported where possible.
+
+
+#define EV_SYN          0x00    //事件同步
+//Used to describe state changes of keyboards, buttons, or other key-like devices.
+#define EV_KEY          0x01    //按键类事件
+//Used to describe absolute axis value changes, e.g. describing the coordinates of a touch on a touchscreen.
+#define EV_ABS          0x03    //绝对坐标类型事件
+
+#define BTN_TOUCH       0x14a   //指示触摸
+
+
+事件分类
+
+这里事件分两个等级,也就是一般先设置支持哪些大类事件,再设置支持大类事件的具体事件,对于事件的这个位定义有如下代码:
+
+#define NBITS(x) (((x)/BITS_PER_LONG)+1)
+可以看到位标志是存在long类型的变量的,xxx_MAX 也就是支持的最大标志数了,也就是这个宏表示的是数组长度
+
+#define BIT(x)  (1UL<<((x)%BITS_PER_LONG))
+表示在一个long中的第几位
+
+#define LONG(x) ((x)/BITS_PER_LONG)
+表示标志在第几个long
+
+unsigned long evbit[NBITS(EV_MAX)];
+unsigned long keybit[NBITS(KEY_MAX)];
+unsigned long relbit[NBITS(REL_MAX)];
+unsigned long absbit[NBITS(ABS_MAX)];
+unsigned long mscbit[NBITS(MSC_MAX)];
+unsigned long ledbit[NBITS(LED_MAX)];
+unsigned long sndbit[NBITS(SND_MAX)];
+unsigned long ffbit[NBITS(FF_MAX)];
+unsigned long swbit[NBITS(SW_MAX)];
+
+所以手动想设置标志可以这么写了
+dev->keybit[LONG(BTN_TOUCH)] = BIT(BTN_TOUCH);
+
+当然有更好的函数调用set_bit,这个是用来设置long类型的某一位
+
+set_bit(BTN_TOUCH, s3c_ts_dev->keybit);
+
+事件设置
+
+在使用触摸屏的时候,还需要对一些参数进行设置,使用input_set_abs_params设置绝对值坐标以及压力值
+
+硬件配置
+
+配置时钟，具体可以参考../归档/linux时钟配置
+
+struct clk* clk;
+clk = clk_get(NULL, "adc");
+clk_enable(clk);
+
+配置 ADC寄存器，这里最关键的就是模式的配置，有adc测量模式，等待中断模式。具体参考裸机的ADC触摸屏.md的等效电路章节
+
+
+申请中断，配置中断函数
+
+
+设计思路
+
+注意： 这里判断按下还是松开，一定要先进入等待中断模式，所以中断中都直接进入等待中断模式
+
+
+这里的滤波只是丢弃第一个后取平均值，没做其他，可以参考
+
+
+adc中断
+    if   松开  put(0,0,0)
+    else 按下  put(data)
+              if   测量满16次，满足上报      开启定时器，等待下次测量
+              else 测量不满16次，不满足上报   继续adc测量
+ts触摸中断
+    if   松开  put(0,0,0)
+    else 按下  启动adc中断
+    
+定时器中断
+    if   松开  put(0,0,0)
+    else 按下  启动adc中断
+    
+put
+    if 0,0,0  直接上报
+    else 
+        满16次，上报
+        不满16次，继续统计
+
+源代码：c
+
+
+测试方法：
+mount -t nfs -o nolock,vers=2 172.16.45.222:/home/book/stu /mnt && cd /mnt/old/dri_test/study_code/18th/  && insmod cfbfillrect.ko && insmod cfbimgblt.ko && insmod cfbcopyarea.ko && insmod lcd.ko
+
+export TSLIB_TSDEVICE=/dev/event0 && export TSLIB_CALIBFILE=/etc/pointercal && export TSLIB_CONFFILE=/etc/ts.conf  && export TSLIB_PLUGINDIR=/lib/ts  && export TSLIB_CONSOLEDEVICE=none  && export TSLIB_FBDEVICE=/dev/fb0
+
+
+
+
+#include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/input.h>
+#include <linux/init.h>
+#include <linux/serio.h>
+#include <linux/delay.h>
+#include <linux/platform_device.h>
+#include <linux/clk.h>
+#include <asm/io.h>
+#include <asm/irq.h>
+#include <asm/plat-s3c24xx/ts.h>
+#include <asm/arch/regs-adc.h>
+#include <asm/arch/regs-gpio.h>
+
+
+/**
+ *   input_dev module test
+ */
+
+
+struct input_dev *g_input_dev;
+static struct timer_list touch_timer;
+
+#define MAX_ADC_CNT  20
+static struct adc_date
+{
+    int _x[MAX_ADC_CNT];
+    int _y[MAX_ADC_CNT];
+    unsigned long x;
+    unsigned long y;
+    int cnt;
+} g_adc_date;
+
+struct s3c2440_adc_reg
+{
+    unsigned long adccon;
+    unsigned long adctsc;
+    unsigned long adcdly;
+    unsigned long adcdat0;
+    unsigned long adcdat1;
+    unsigned long adcupdn;
+};
+static volatile struct s3c2440_adc_reg *g_s3c2440_adc_reg;
+static int time_enable = 0;
+
+
+#define MODE_ADC_START   0   //get X and Y adc
+#define MODE_WAIT_DOWN 1
+#define MODE_WAIT_UP       2
+#define MODE_WAIT_IRQ      3
+static void __inline select_mode(int mode)
+{
+    time_enable = 0;
+    switch (mode)
+    {
+    case MODE_ADC_START:
+    {
+        g_s3c2440_adc_reg->adctsc = (1 << 3) | (1 << 2); // mode select
+        g_s3c2440_adc_reg->adccon |= (1 << 0);  //start adc
+        break;
+    }
+    case MODE_WAIT_DOWN:
+    {
+        g_s3c2440_adc_reg->adctsc = 0xd3; // mode select
+        break;
+    }
+    case MODE_WAIT_UP:
+    {
+        g_s3c2440_adc_reg->adctsc = 0x1d3; // mode select
+        break;
+    }
+    case MODE_WAIT_IRQ:
+    {
+        g_s3c2440_adc_reg->adctsc |= 0x03; // mode select
+        break;
+    }
+    default:
+    {
+        printk("mode is err,please check");
+        break;
+    }
+    }
+}
+
+/**
+ * @param x
+ * @param y
+ * @param isdown  1=down,0=up
+ *
+ * @return  1 =fifo is full
+ */
+static int put_adc(int x, int y, int isdown)
+{
+    int i = 0;
+    if (isdown)
+    {
+        g_adc_date._x[g_adc_date.cnt] = x;
+        g_adc_date._y[g_adc_date.cnt] = y;
+        //printk("x=%d,y=%d\r\n",x,y);
+    }
+    else
+    {
+        printk("now is up\r\n");
+        input_report_abs(g_input_dev, ABS_PRESSURE, 0);
+        input_report_key(g_input_dev, BTN_TOUCH, 0);
+        input_sync(g_input_dev);
+        g_adc_date.cnt = 0;
+        return 0;
+    }
+
+    g_adc_date.cnt++;
+    if (g_adc_date.cnt >= MAX_ADC_CNT)
+    {
+        g_adc_date.x = 0;
+        g_adc_date.y = 0;
+        for (i = 0; i < MAX_ADC_CNT; i++)
+        {
+            g_adc_date.x += g_adc_date._x[i];
+            g_adc_date.y += g_adc_date._y[i];
+        }
+        g_adc_date.x /= MAX_ADC_CNT;
+        g_adc_date.y /= MAX_ADC_CNT;
+
+        printk("x=%d,y=%d\r\n",g_adc_date.x,g_adc_date.y);
+        input_report_abs(g_input_dev, ABS_X, g_adc_date.x);
+        input_report_abs(g_input_dev, ABS_Y, g_adc_date.y);
+        input_report_abs(g_input_dev, ABS_PRESSURE, 1);
+        input_report_key(g_input_dev, BTN_TOUCH, 1);
+        input_sync(g_input_dev);
+        g_adc_date.cnt = 0;
+        return 1;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+static irqreturn_t irq_adc_ts_fun ( int irq, void *dev_id)
+{
+    //printk("get in pendown irq\r\n");
+    select_mode(MODE_WAIT_IRQ);
+    if (g_s3c2440_adc_reg->adcdat0 & (1 << 15)) //now is up
+    {
+        put_adc(0, 0, 0);
+        select_mode(MODE_WAIT_DOWN);
+    }
+    else
+    {
+        //  ignore the first adc data for pur_adc ()
+        select_mode(MODE_ADC_START);
+    }
+    return IRQ_HANDLED;
+}
+
+static irqreturn_t irq_adc_get_fun ( int irq, void *dev_id)
+{
+    int x = (g_s3c2440_adc_reg->adcdat0)&0x3FF;
+    int y = (g_s3c2440_adc_reg->adcdat1)&0x3FF;
+
+    select_mode(MODE_WAIT_IRQ);
+    if (g_s3c2440_adc_reg->adcdat0 & (1 << 15)) //now is up
+    {
+        put_adc(0, 0, 0);
+        select_mode(MODE_WAIT_DOWN);
+    }
+    else
+    {
+        if(put_adc(x, y, 1))
+        {
+            // fifo is full ,hold to sleep for ms
+            select_mode(MODE_WAIT_UP);
+            time_enable = 1;
+            mod_timer(&touch_timer, jiffies + HZ/100);
+        }
+        else
+        {
+            select_mode(MODE_ADC_START);
+        }
+    }
+
+    return IRQ_HANDLED;
+}
+static void irq_time_fun(unsigned long data)
+{
+    if (!time_enable) return ;
+    select_mode(MODE_WAIT_IRQ);
+    if (g_s3c2440_adc_reg->adcdat0 & (1 << 15)) //now is up
+    {
+        put_adc(0, 0, 0);
+        select_mode(MODE_WAIT_DOWN);
+    }
+    else
+    {
+        select_mode(MODE_ADC_START);
+    }
+}
+
+
+static int __init dri_init(void)
+{
+    printk("hello, insmod \r\n");
+
+    // allocate a memory for input_dev
+    g_input_dev = input_allocate_device();
+
+    //set the input_dev
+    //设置分两类：产生哪类事件；产生这类事件中的哪些具体事件〿    // event lever class
+    
+	//set_bit(EV_SYN, g_input_dev->evbit);
+    set_bit(EV_KEY, g_input_dev->evbit);
+    set_bit(EV_ABS, g_input_dev->evbit);
+
+    // event lever bit
+    set_bit(BTN_TOUCH, g_input_dev->keybit);
+    input_set_abs_params(g_input_dev, ABS_X, 0, 0x3FF, 0, 0);   //2440 adcbit=10=1024
+    input_set_abs_params(g_input_dev, ABS_Y, 0, 0x3FF, 0, 0);
+    input_set_abs_params(g_input_dev, ABS_PRESSURE, 0, 1, 0, 0);//touch or release
+    //registe the input_dev
+    input_register_device(g_input_dev);
+
+    /**
+     * hardware set
+     * 1. set clock
+     * 2. set othee regs
+    */
+    {
+        struct clk *clk;
+        clk = clk_get(NULL, "adc");
+        clk_enable(clk);
+    }
+
+    g_s3c2440_adc_reg = ioremap(0x58000000, sizeof(struct s3c2440_adc_reg));
+    /* bit[14]  : 1-A/D converter prescaler enable
+     * bit[13:6]: A/D converter prescaler value,
+     *            49, ADCCLK=PCLK/(49+1)=50MHz/(49+1)=1MHz
+     * bit[0]: A/D conversion starts by enable. 先设丿
+     */
+    g_s3c2440_adc_reg->adccon = (1 << 14) | (49 << 6);
+    // max delay for adc
+    g_s3c2440_adc_reg->adcdly = 0xffff;
+
+
+
+    request_irq(IRQ_ADC, irq_adc_get_fun, IRQF_SAMPLE_RANDOM, "adc_get", NULL);
+    request_irq(IRQ_TC, irq_adc_ts_fun, IRQF_SAMPLE_RANDOM, "adc_ts", NULL);
+    init_timer(&touch_timer);
+    touch_timer.function = irq_time_fun;
+    add_timer(&touch_timer);
+
+    memset(&g_adc_date, 0x00, sizeof(g_adc_date));
+
+    select_mode(MODE_WAIT_DOWN);
+    return 0;
+}
+
+static void __exit dri_exit(void)
+{
+    free_irq(IRQ_TC, NULL);
+    free_irq(IRQ_ADC, NULL);
+    iounmap(g_s3c2440_adc_reg);
+    input_unregister_device(g_input_dev);
+    input_free_device(g_input_dev);
+    del_timer(&touch_timer);
+    printk("goodbye, remod \r\n");
+}
+
+module_init(dri_init);
+module_exit(dri_exit);
+MODULE_LICENSE("GPL");
+
+
+
+
+
